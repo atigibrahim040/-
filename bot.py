@@ -5,12 +5,12 @@ import time
 import threading
 import logging
 import requests
+import yt_dlp
 
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "8609529978:AAGLWxFRa3UPn_Ly14ovC75sYcxLRZx3naI")
 ADMIN_ID     = os.environ.get("ADMIN_ID", "")
 DOWNLOAD_DIR = "downloads"
 MAX_TG_SIZE  = 50 * 1024 * 1024
-API_EXTRACT  = os.environ.get("API_EXTRACT", "https://cobalt.tools/api/json")
 TG_BASE      = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 logging.basicConfig(
@@ -160,53 +160,84 @@ def send_document(chat_id, path, caption=""):
 
 
 def api_extract(url):
-    """استخراج روابط التحميل"""
+    """استخراج روابط التحميل باستخدام yt-dlp"""
     try:
-        # Cobalt API - مجاني وبدون حقوق
-        r = requests.post(
-            API_EXTRACT,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json"
-            },
-            json={
-                "url": url,
-                "isAudioOnly": False,
-                "aFormat": "mp3"
-            },
-            timeout=60,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("status") == "stream":
-                return {
-                    "title": data.get("filename", "video"),
-                    "author": "Unknown",
-                    "source": "web",
-                    "duration": 0,
-                    "views": 0,
-                    "likes": 0,
-                    "thumbnail": None,
-                    "formats": [
-                        {
-                            "label": "HD",
-                            "ext": "mp4",
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            if not info:
+                return None
+            
+            formats = []
+            
+            # استخراج أفضل فيديو
+            best_video = None
+            best_audio = None
+            
+            for f in info.get('formats', []):
+                if f.get('vcodec') != 'none' and f.get('acodec') == 'none':
+                    height = f.get('height', 0)
+                    if not best_video or height > best_video.get('height', 0):
+                        best_video = f
+                elif f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+                    if not best_audio:
+                        best_audio = f
+            
+            if best_video:
+                formats.append({
+                    "label": f"{best_video.get('height', '?')}p",
+                    "ext": best_video.get('ext', 'mp4'),
+                    "type": "video",
+                    "url": best_video.get('url')
+                })
+            
+            if best_audio:
+                formats.append({
+                    "label": "MP3",
+                    "ext": "mp3",
+                    "type": "audio",
+                    "url": best_audio.get('url')
+                })
+            
+            if not formats:
+                for f in info.get('formats', []):
+                    if f.get('url') and f.get('vcodec') != 'none':
+                        formats.append({
+                            "label": f"{f.get('height', '?')}p",
+                            "ext": f.get('ext', 'mp4'),
                             "type": "video",
-                            "url": data.get("url")
-                        }
-                    ]
-                }
-        log.warning(f"api_extract status: {r.status_code}")
-        return None
+                            "url": f.get('url')
+                        })
+                        break
+            
+            return {
+                "title": info.get('title', 'video'),
+                "author": info.get('uploader', info.get('channel', 'Unknown')),
+                "source": info.get('extractor', 'web'),
+                "duration": info.get('duration', 0),
+                "views": info.get('view_count', 0),
+                "likes": info.get('like_count', 0),
+                "thumbnail": info.get('thumbnail'),
+                "formats": formats
+            }
+            
     except Exception as e:
-        log.warning(f"api_extract: {e}")
+        log.warning(f"yt-dlp extract: {e}")
         return None
 
 
 def api_health():
+    """فحص yt-dlp"""
     try:
-        return requests.get("https://cobalt.tools", timeout=10).status_code == 200
-    except Exception:
+        import yt_dlp
+        return True
+    except ImportError:
         return False
 
 
@@ -532,11 +563,11 @@ def main():
         return
     log.info(f" البوت: @{me['result']['username']}")
 
-    log.info(" فحص API ...")
+    log.info(" فحص yt-dlp ...")
     if api_health():
-        log.info(" API يعمل")
+        log.info(" yt-dlp يعمل")
     else:
-        log.warning(" API لا يستجيب - سنحاول على أي حال")
+        log.warning(" yt-dlp غير مثبت")
 
     log.info(" البوت يعمل الآن. اضغط Ctrl+C للإيقاف.")
     print()
