@@ -2,59 +2,67 @@ import os
 import re
 import json
 import time
+import sqlite3
 import threading
 import logging
 import requests
 import yt_dlp
 
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "8609529978:AAGLWxFRa3UPn_Ly14ovC75sYcxLRZx3naI")
-ADMIN_ID     = os.environ.get("ADMIN_ID", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8609529978:AAGLWxFRa3UPn_Ly14ovC75sYcxLRZx3naI")
+ADMIN_ID  = str(os.environ.get("ADMIN_ID", ""))
+DB_PATH   = "bot.db"
 DOWNLOAD_DIR = "downloads"
-MAX_TG_SIZE  = 50 * 1024 * 1024
-TG_BASE      = f"https://api.telegram.org/bot{BOT_TOKEN}"
+MAX_TG_SIZE  = 49 * 1024 * 1024
+TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("bot")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-sessions     = {}
+# ─── قاعدة البيانات ───
+db_lock = threading.Lock()
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn.execute("""CREATE TABLE IF NOT EXISTS users(
+    user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+    joined_at TEXT, downloads INTEGER DEFAULT 0)""")
+conn.commit()
+
+def add_user(uid, username, first_name):
+    with db_lock:
+        conn.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?,0)",
+                     (uid, username or "", first_name or "", time.strftime("%Y-%m-%d")))
+        conn.execute("UPDATE users SET username=?, first_name=? WHERE user_id=?",
+                     (username or "", first_name or "", uid))
+        conn.commit()
+
+def get_users_count():
+    with db_lock:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+def get_all_users():
+    with db_lock:
+        return [r[0] for r in conn.execute("SELECT user_id FROM users")]
+
+def add_download(uid):
+    with db_lock:
+        conn.execute("UPDATE users SET downloads = downloads + 1 WHERE user_id=?", (uid,))
+        conn.commit()
+
+# ─── الجلسات ───
+sessions = {}
 session_lock = threading.Lock()
+admin_state = {}  # حالة الأدمن (بانتظار رسالة الإذاعة...)
 
-stats      = {"total": 0, "success": 0, "fail": 0}
+stats = {"success": 0, "fail": 0}
 stats_lock = threading.Lock()
-
 OFFSET = 0
 
+def is_admin(uid): return str(uid) == str(ADMIN_ID)
 
-def human_size(b):
-    if not b:
-        return "?"
-    for u in ("B", "KB", "MB", "GB"):
-        if b < 1024:
-            return f"{b:.1f} {u}"
-        b /= 1024
-    return f"{b:.1f} TB"
-
-
-def human_duration(sec):
-    if not sec:
-        return "?"
-    m, s = divmod(int(sec), 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-def safe_filename(name):
-    name = re.sub(r'[\\/:*?"<>|\n\r\t]', "_", name)
-    return (name[:80].strip() or "video")
-
-
-def tg_call(method, data=None, files=None, timeout=30):
+# ═══════════ وظائف تيليجرام ═══════════
+def tg_call(method, data=None, files=None, timeout=60):
     try:
         r = requests.post(f"{TG_BASE}/{method}", data=data, files=files, timeout=timeout)
         return r.json()
@@ -62,540 +70,443 @@ def tg_call(method, data=None, files=None, timeout=30):
         log.warning(f"tg_call({method}): {e}")
         return {"ok": False}
 
-
-def send_message(chat_id, text, parse_mode="Markdown", reply_markup=None, reply_to=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text[:4000],
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,
-    }
+def send_message(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text[:4000],
+               "parse_mode": "Markdown", "disable_web_page_preview": True}
     if reply_markup:
-        payload["reply_markup"] = (
-            json.dumps(reply_markup) if isinstance(reply_markup, dict) else reply_markup
-        )
-    if reply_to:
-        payload["reply_to_message_id"] = reply_to
+        payload["reply_markup"] = json.dumps(reply_markup)
     return tg_call("sendMessage", data=payload)
 
+def edit_message(chat_id, mid, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "message_id": mid, "text": text[:4000],
+               "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    return tg_call("editMessageText", data=payload)
 
-def edit_message(chat_id, message_id, text, parse_mode="Markdown"):
-    return tg_call("editMessageText", data={
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text[:4000],
-        "parse_mode": parse_mode,
-    })
-
-
-def delete_message(chat_id, message_id):
-    return tg_call("deleteMessage", data={
-        "chat_id": chat_id,
-        "message_id": message_id,
-    })
-
-
-def send_chat_action(chat_id, action="typing"):
-    tg_call("sendChatAction", data={"chat_id": chat_id, "action": action})
-
+def delete_message(chat_id, mid):
+    tg_call("deleteMessage", data={"chat_id": chat_id, "message_id": mid})
 
 def answer_callback(cb_id, text=""):
     tg_call("answerCallbackQuery", data={"callback_query_id": cb_id, "text": text})
 
+def send_action(chat_id, action):
+    tg_call("sendChatAction", data={"chat_id": chat_id, "action": action})
 
-def send_photo(chat_id, photo_url, caption=""):
-    return tg_call("sendPhoto", data={
-        "chat_id": chat_id,
-        "photo": photo_url,
-        "caption": caption[:1000],
-        "parse_mode": "Markdown",
-    })
-
-
-def send_video(chat_id, path, caption="", duration=None):
+def send_video(chat_id, path, caption, duration=0):
     try:
         with open(path, "rb") as f:
-            data = {
-                "chat_id": chat_id,
-                "caption": caption[:1000],
-                "supports_streaming": True,
-            }
-            if duration:
-                data["duration"] = int(duration)
-            r = tg_call("sendVideo", data=data, files={"video": f}, timeout=600)
-            return r.get("ok", False)
+            data = {"chat_id": chat_id, "caption": caption[:1000],
+                    "supports_streaming": True, "parse_mode": "Markdown"}
+            if duration: data["duration"] = int(duration)
+            return tg_call("sendVideo", data=data, files={"video": f}, timeout=900).get("ok", False)
     except Exception as e:
-        log.warning(f"send_video: {e}")
-        return False
+        log.warning(f"send_video: {e}"); return False
 
-
-def send_audio(chat_id, path, caption="", title="", performer=""):
+def send_audio(chat_id, path, caption, title="", performer=""):
     try:
         with open(path, "rb") as f:
-            data = {"chat_id": chat_id, "caption": caption[:1000]}
-            if title:
-                data["title"] = title[:64]
-            if performer:
-                data["performer"] = performer[:64]
-            r = tg_call("sendAudio", data=data, files={"audio": f}, timeout=600)
-            return r.get("ok", False)
+            data = {"chat_id": chat_id, "caption": caption[:1000],
+                    "parse_mode": "Markdown", "title": title[:64], "performer": performer[:64]}
+            return tg_call("sendAudio", data=data, files={"audio": f}, timeout=900).get("ok", False)
     except Exception as e:
-        log.warning(f"send_audio: {e}")
-        return False
+        log.warning(f"send_audio: {e}"); return False
 
-
-def send_document(chat_id, path, caption=""):
+def send_document(chat_id, path, caption):
     try:
         with open(path, "rb") as f:
-            r = tg_call(
-                "sendDocument",
-                data={"chat_id": chat_id, "caption": caption[:1000]},
-                files={"document": f},
-                timeout=600,
-            )
-            return r.get("ok", False)
-    except Exception as e:
-        log.warning(f"send_document: {e}")
+            return tg_call("sendDocument",
+                data={"chat_id": chat_id, "caption": caption[:1000], "parse_mode": "Markdown"},
+                files={"document": f}, timeout=900).get("ok", False)
+    except Exception:
         return False
 
+# ═══════════ أدوات ═══════════
+def human_size(b):
+    if not b: return "?"
+    for u in ("B","KB","MB","GB"):
+        if b < 1024: return f"{b:.1f} {u}"
+        b /= 1024
+    return f"{b:.1f} TB"
 
-def api_extract(url):
-    """استخراج روابط التحميل باستخدام yt-dlp"""
+def human_duration(sec):
+    if not sec: return "0:00"
+    m, s = divmod(int(sec), 60); h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+def safe_filename(name):
+    return (re.sub(r'[\\/:*?"<>|\n\r\t]', "_", name)[:60].strip() or "video")
+
+def progress_bar(done, total):
+    pct = done * 100 // max(total, 1)
+    return f"`[{ '█' * (pct//5)}{'░' * (20 - pct//5)}] {pct}%`", pct
+
+# ═══════════ الأزرار الاحترافية ═══════════
+def kb_main():
+    return {"inline_keyboard": [
+        [{"text": " 🎬 تحميل فيديو (HD + صوت)", "callback_data": "dl:video"}],
+        [{"text": " 🎵 تحميل صوت فقط (MP3)", "callback_data": "dl:audio"}],
+        [{"text": " ℹ️ صيغ إضافية", "callback_data": "dl:formats"}],
+    ]}
+
+def kb_formats(formats):
+    rows, row = [], []
+    for i, f in enumerate(formats[:8]):
+        row.append({"text": f" {f.get('height','?')}p", "callback_data": f"fmt:{i}"})
+        if len(row) == 3: rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([{"text": " 🔙 رجوع", "callback_data": "dl:back"}])
+    return {"inline_keyboard": rows}
+
+def kb_admin():
+    return {"inline_keyboard": [
+        [{"text": " 📊 الإحصائيات", "callback_data": "adm:stats"}],
+        [{"text": " 📢 إذاعة للجميع", "callback_data": "adm:broadcast"},
+         {"text": " 👥 المستخدمون", "callback_data": "adm:users"}],
+        [{"text": " 🔴 إيقاف البوت", "callback_data": "adm:ping"}],
+    ]}
+
+# ═══════════ استخراج المعلومات ═══════════
+def extract_info(url):
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            if not info:
-                return None
-            
-            formats = []
-            
-            # استخراج أفضل فيديو
-            best_video = None
-            best_audio = None
-            
-            for f in info.get('formats', []):
-                if f.get('vcodec') != 'none' and f.get('acodec') == 'none':
-                    height = f.get('height', 0)
-                    if not best_video or height > best_video.get('height', 0):
-                        best_video = f
-                elif f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                    if not best_audio:
-                        best_audio = f
-            
-            if best_video:
-                formats.append({
-                    "label": f"{best_video.get('height', '?')}p",
-                    "ext": best_video.get('ext', 'mp4'),
-                    "type": "video",
-                    "url": best_video.get('url')
-                })
-            
-            if best_audio:
-                formats.append({
-                    "label": "MP3",
-                    "ext": "mp3",
-                    "type": "audio",
-                    "url": best_audio.get('url')
-                })
-            
-            if not formats:
-                for f in info.get('formats', []):
-                    if f.get('url') and f.get('vcodec') != 'none':
-                        formats.append({
-                            "label": f"{f.get('height', '?')}p",
-                            "ext": f.get('ext', 'mp4'),
-                            "type": "video",
-                            "url": f.get('url')
-                        })
-                        break
-            
-            return {
-                "title": info.get('title', 'video'),
-                "author": info.get('uploader', info.get('channel', 'Unknown')),
-                "source": info.get('extractor', 'web'),
-                "duration": info.get('duration', 0),
-                "views": info.get('view_count', 0),
-                "likes": info.get('like_count', 0),
-                "thumbnail": info.get('thumbnail'),
-                "formats": formats
-            }
-            
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+            return ydl.extract_info(url, download=False)
     except Exception as e:
-        log.warning(f"yt-dlp extract: {e}")
+        log.warning(f"extract: {e}")
         return None
 
+def fmt_qualities(info):
+    out = []
+    seen = set()
+    for f in info.get('formats', []):
+        if f.get('vcodec') != 'none' and f.get('height'):
+            h = f['height']
+            if h not in seen and f.get('url'):
+                seen.add(h)
+                out.append({'height': h, 'ext': f.get('ext','mp4'), 'url': info.get('webpage_url'), 'format_id': f['format_id']})
+    return sorted(out, key=lambda x: -x['height'])[:6]
 
-def api_health():
-    """فحص yt-dlp"""
+# ═══════════ التحميل بـ yt-dlp (فيديو + صوت مدموج!) ═══════════
+def ytdlp_download(url, out_path, mode, fmt_id=None, progress_cb=None):
+    last = [0.0]
+    def hook(d):
+        if d['status'] == 'downloading' and progress_cb:
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            if total and time.time() - last[0] >= 3:
+                last[0] = time.time()
+                progress_cb(d.get('downloaded_bytes', 0), total)
+    opts = {
+        'outtmpl': out_path,
+        'quiet': True, 'no_warnings': True,
+        'progress_hooks': [hook],
+        'merge_output_format': 'mp4',
+        'ffmpeg_location': '/usr/bin/ffmpeg',
+    }
+    if mode == 'video':
+        opts['format'] = f"{fmt_id}+bestaudio/best" if fmt_id else "bestvideo+bestaudio/best"
+    elif mode == 'audio':
+        opts['format'] = "bestaudio/best"
+        opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
     try:
-        import yt_dlp
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
         return True
-    except ImportError:
-        return False
-
-
-def download_file(url, filepath, progress_cb=None):
-    try:
-        with requests.get(url, stream=True, timeout=180) as r:
-            total = int(r.headers.get("content-length", 0))
-            done = 0
-            with open(filepath, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    done += len(chunk)
-                    if progress_cb and total:
-                        progress_cb(done, total)
-        return os.path.getsize(filepath) > 1000
     except Exception as e:
-        log.warning(f"download_file: {e}")
+        log.warning(f"ytdlp_download: {e}")
         return False
 
+def find_file(title, exts):
+    base = safe_filename(title)
+    for ext in exts:
+        p = os.path.join(DOWNLOAD_DIR, f"{base}.{ext}")
+        if os.path.exists(p) and os.path.getsize(p) > 10000:
+            return p
+    # yt-dlp أحياناً يضيف رقم
+    for f in os.listdir(DOWNLOAD_DIR):
+        if f.startswith(base[:30]) and f.rsplit('.',1)[-1] in exts:
+            p = os.path.join(DOWNLOAD_DIR, f)
+            if os.path.getsize(p) > 10000: return p
+    return None
 
-def build_caption(data):
-    title  = data.get("title", "بدون عنوان")
-    author = data.get("author", "-")
-    dur    = human_duration(data.get("duration"))
-    views  = data.get("views", 0) or 0
-    likes  = data.get("likes", 0) or 0
-    source = data.get("source", "-")
+# ═══════════ معالجة الرابط ═══════════
+def process_link(chat_id, user_id, url):
+    msg = send_message(chat_id, " ⏳ *جارٍ تحليل الرابط...*")
+    mid = msg.get("result", {}).get("message_id")
 
-    return (
-        f"*{title}*\n\n"
-        f"القناة: `{author}`\n"
-        f"المصدر: `{source}`\n"
-        f"المدة: `{dur}`\n"
-        f"المشاهدات: `{views:,}`\n"
-        f"اللايكات: `{likes:,}`"
-    )
-
-
-def build_keyboard(formats):
-    buttons, row = [], []
-    for i, fmt in enumerate(formats):
-        label = fmt.get("label", "?")
-        ext   = fmt.get("ext", "?")
-        row.append({"text": f"{label} - {ext}", "callback_data": f"fmt:{i}"})
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([{"text": " فيديو + صوتيه ", "callback_data": "both"}])
-    return {"inline_keyboard": buttons}
-
-
-def process_link(chat_id, url, user_id):
-    send_message(chat_id, " جاري جلب المعلومات...")
-
-    data = api_extract(url)
-    if not data:
-        send_message(chat_id, " فشل جلب المعلومات. تأكد من الرابط.")
-        with stats_lock:
-            stats["fail"] += 1
+    info = extract_info(url)
+    if not info:
+        edit_message(chat_id, mid, " ❌ *تعذر جلب الفيديو!*\nتأكد أن الرابط صحيح والفيديو عام.")
+        with stats_lock: stats["fail"] += 1
         return
 
-    with stats_lock:
-        stats["total"] += 1
-
-    title = data.get("title", "video")
-    thumb = data.get("thumbnail")
+    title   = info.get('title', 'فيديو')
+    author  = info.get('uploader') or info.get('channel') or "-"
+    thumb   = info.get('thumbnail')
+    dur     = info.get('duration') or 0
+    views   = info.get('view_count') or 0
+    likes   = info.get('like_count') or 0
 
     with session_lock:
-        sessions[user_id] = {"data": data, "title": title}
+        sessions[user_id] = {
+            "url": url, "info": info, "title": title,
+            "qualities": fmt_qualities(info),
+        }
 
-    caption = build_caption(data)
+    text = (f"🎬 *{title}*\n\n"
+            f"👤 `{author}`\n"
+            f"⏱ المدة: `{human_duration(dur)}`  |  👁 `{views:,}`\n\n"
+            f"❓ *كيف تريد التحميل؟*")
 
     if thumb:
-        res = send_photo(chat_id, thumb, caption)
-        if not res.get("ok"):
-            send_message(chat_id, caption)
+        delete_message(chat_id, mid)
+        r = tg_call("sendPhoto", data={"chat_id": chat_id, "photo": thumb,
+                    "caption": text[:1000], "parse_mode": "Markdown",
+                    "reply_markup": json.dumps(kb_main())})
+        if not r.get("ok"):
+            send_message(chat_id, text, kb_main())
     else:
-        send_message(chat_id, caption)
+        edit_message(chat_id, mid, text, kb_main())
 
-    formats = data.get("formats", [])
-    if formats:
-        send_message(chat_id, " اختر الصيغة:",
-                     reply_markup=build_keyboard(formats))
-    else:
-        send_message(chat_id, " لا توجد صيغ تحميل متاحة.")
-
-
-def download_and_send(chat_id, user_id, fmt_index):
+# ═══════════ التحميل والإرسال ═══════════
+def do_download(chat_id, user_id, mode, fmt_id=None):
     with session_lock:
         sess = sessions.get(user_id)
     if not sess:
-        send_message(chat_id, " انتهت الجلسة. أرسل الرابط مرة أخرى.")
+        send_message(chat_id, " ⌛ انتهت الجلسة، أرسل الرابط من جديد.")
         return
 
-    data    = sess["data"]
-    title   = sess["title"]
-    formats = data.get("formats", [])
+    url   = sess["url"]
+    info  = sess["info"]
+    title = sess["title"]
+    dur   = info.get('duration') or 0
+    author = info.get('uploader') or info.get('channel') or ""
 
-    if not (0 <= fmt_index < len(formats)):
-        send_message(chat_id, " صيغة غير صحيحة.")
-        return
+    labels = {"video": "🎬 فيديو HD بالصوت", "audio": "🎵 صوت MP3", "fmt": "🎬 فيديو"}
+    label = labels.get(mode, "ملف")
 
-    fmt   = formats[fmt_index]
-    label = fmt.get("label", "?")
-    ext   = fmt.get("ext", "mp4")
-    kind  = fmt.get("type", "video")
-    url   = fmt.get("url")
-
-    filename = f"{safe_filename(title)}.{ext}"
-    filepath = os.path.join(DOWNLOAD_DIR, filename)
-
-    status    = send_message(chat_id, f" جاري تحميل {label}...")
-    status_id = status.get("result", {}).get("message_id") if status.get("ok") else None
-
-    send_chat_action(chat_id, "upload_video" if kind == "video" else "upload_voice")
-
-    last = [0.0]
+    status = send_message(chat_id, f" ⬇️ *جارٍ تحميل {label}...*")
+    sid = status.get("result", {}).get("message_id")
+    send_action(chat_id, "upload_video" if mode != "audio" else "upload_voice")
 
     def on_progress(done, total):
-        if time.time() - last[0] < 3:
-            return
-        last[0] = time.time()
-        pct = done * 100 // max(total, 1)
-        bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-        if status_id:
-            edit_message(
-                chat_id, status_id,
-                f" *تحميل {label}*\n`[{bar}] {pct}%`\n"
-                f"{human_size(done)} / {human_size(total)}"
-            )
+        bar, _ = progress_bar(done, total)
+        if sid:
+            edit_message(chat_id, sid,
+                f" ⬇️ *{label}*\n{bar}\n{human_size(done)} / {human_size(total)}")
 
-    if not download_file(url, filepath, on_progress):
-        send_message(chat_id, " فشل التحميل.")
-        with stats_lock:
-            stats["fail"] += 1
+    base = safe_filename(title)
+    ok = ytdlp_download(url, os.path.join(DOWNLOAD_DIR, base), mode, fmt_id, on_progress)
+
+    exts = ['mp4', 'mkv', 'webm'] if mode != 'audio' else ['mp3', 'm4a']
+    path = find_file(base, exts) if ok else None
+
+    if not path:
+        if sid: edit_message(chat_id, sid, " ❌ *فشل التحميل!* حاول صيغة أخرى.")
+        with stats_lock: stats["fail"] += 1
         return
 
-    size = os.path.getsize(filepath)
-
-    if status_id:
-        delete_message(chat_id, status_id)
+    size = os.path.getsize(path)
+    if sid: delete_message(chat_id, sid)
 
     if size > MAX_TG_SIZE:
-        send_message(
-            chat_id,
-            f" الملف كبير ({human_size(size)})\n"
-            f"الحد الأقصى لتليكرام هو 50MB.\n\n🔗 الرابط المباشر:\n`{url}`"
-        )
+        send_message(chat_id,
+            f" ⚠️ *الملف كبير جداً!* ({human_size(size)})\n"
+            f"حد تيليجرام: 50MB\n\n🔗 [تحميل مباشر]({info.get('webpage_url', url)})")
     else:
-        caption = f"*{title}*\n {label} - {human_size(size)}"
+        caption = f"🎬 *{title}*\n👤 `{author}`\n📦 `{human_size(size)}`"
         sent = False
-        if kind == "video":
-            sent = send_video(chat_id, filepath, caption, duration=data.get("duration"))
-        elif kind == "audio":
-            sent = send_audio(chat_id, filepath, caption,
-                              title=title, performer=data.get("author", ""))
+        if mode == 'audio':
+            sent = send_audio(chat_id, path, caption, title=title, performer=author)
         else:
-            sent = send_document(chat_id, filepath, caption)
-
+            sent = send_video(chat_id, path, caption, duration=dur)
+        if not sent:
+            sent = send_document(chat_id, path, caption)
         if sent:
-            with stats_lock:
-                stats["success"] += 1
+            with stats_lock: stats["success"] += 1
+            add_download(user_id)
 
-    try:
-        os.remove(filepath)
-    except OSError:
-        pass
+    try: os.remove(path)
+    except OSError: pass
 
+# ═══════════ لوحة تحكم الأدمن ═══════════
+def admin_panel(chat_id):
+    send_message(chat_id,
+        " 👑 *لوحة تحكم المالك*\n\nاختر من القائمة:",
+        kb_admin())
 
-def download_both(chat_id, user_id):
-    with session_lock:
-        sess = sessions.get(user_id)
-    if not sess:
-        send_message(chat_id, " انتهت الجلسة.")
-        return
+def admin_stats(chat_id):
+    total_dl = 0
+    with db_lock:
+        total_dl = conn.execute("SELECT SUM(downloads) FROM users").fetchone()[0] or 0
+    with stats_lock: s = dict(stats)
+    send_message(chat_id,
+        f" 📊 *إحصائيات البوت*\n\n"
+        f"👥 المستخدمون: `{get_users_count()}`\n"
+        f"📥 إجمالي التحميلات: `{total_dl}`\n"
+        f"✅ ناجحة: `{s['success']}`\n"
+        f"❌ فاشلة: `{s['fail']}`\n"
+        f"⏰ التشغيل: كل 5 ساعات تلقائياً",
+        kb_admin())
 
-    formats = sess["data"].get("formats", [])
-    picks   = []
+def do_broadcast(text):
+    users = get_all_users()
+    ok, fail = 0, 0
+    for uid in users:
+        try:
+            r = send_message(uid, f" 📢 *إذاعة*\n\n{text}")
+            if r.get("ok"): ok += 1
+            else: fail += 1
+        except Exception:
+            fail += 1
+        time.sleep(0.05)
+    return ok, fail
 
-    video = next((f for f in formats if f.get("type") == "video"), None)
-    audio = next((f for f in formats if f.get("type") == "audio"), None)
+# ═══════════ الرسائل ═══════════
+WELCOME = """👑 *أهلاً بك في البوت الذهبي*
 
-    if video:
-        picks.append(formats.index(video))
-    if audio:
-        picks.append(formats.index(audio))
+📥 حمّل من *1000+ موقع*:
+YouTube • TikTok • Instagram • X • Facebook • والمزيد
 
-    for idx in picks:
-        download_and_send(chat_id, user_id, idx)
+⚡ أرسل الرابط مباشرة واختر: فيديو 🎬 أو صوت 🎵
 
-
-WELCOME = """🎬 *مرحباً بك في بوت تحميل الفيديوهات*
-
- أرسل أي رابط فيديو من:
-YouTube | TikTok | Instagram | X | 1600+ موقع
-
-⚡ *مثال:*
-`https://youtu.be/l08Zw-RY__Q`
-
-📌 *الأوامر:*
-/start - البداية
-/help - المساعدة
-/stats - الإحصائيات
-/id - ايديك
-"""
+📌 /start - البداية
+📖 /help - المساعدة
+🆔 /id - معرفك"""
 
 HELP = """📖 *طريقة الاستخدام*
 
-1️⃣ أرسل رابط فيديو
-2️⃣ البوت يعرض العنوان والقناة والصيغ
-3️⃣ اختر الصيغة للتحميل
+1️⃣ أرسل رابط أي فيديو
+2️⃣ البوت يعرض معلومات الفيديو
+3️⃣ اختر: 🎬 فيديو بالصوت أو 🎵 MP3
+4️⃣ استلم الملف مباشرة!
 
-"""
+✨ مميزات: جودة HD، صوت نقي، سرعة فائقة"""
 
-
-def handle_command(chat_id, cmd, user_id, username):
-    if cmd == "/start":
-        send_message(chat_id, WELCOME)
-    elif cmd == "/help":
-        send_message(chat_id, HELP)
-    elif cmd == "/id":
-        send_message(chat_id, f" `{user_id}`\n @{username}")
-    elif cmd == "/stats":
-        with stats_lock:
-            s = dict(stats)
-        send_message(chat_id,
-            f"*إحصائيات البوت*\n\n"
-            f" الإجمالي: `{s['total']}`\n"
-            f" نجحت: `{s['success']}`\n"
-            f" فشلت: `{s['fail']}`"
-        )
-
-
-URL_REGEX = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
-
-
-def extract_url(text):
-    m = URL_REGEX.search(text)
-    return m.group(0) if m else None
-
-
+# ═══════════ المعالجات ═══════════
 def handle_message(msg):
     chat_id  = msg["chat"]["id"]
     user_id  = msg["from"]["id"]
-    username = msg["from"].get("username", "unknown")
+    username = msg["from"].get("username", "")
+    fname    = msg["from"].get("first_name", "")
     text     = (msg.get("text") or "").strip()
 
-    if not text:
+    add_user(user_id, username, fname)
+
+    # وضع إذاعة الأدمن
+    if is_admin(user_id) and admin_state.get(user_id) == "await_broadcast":
+        admin_state.pop(user_id, None)
+        status = send_message(chat_id, " 📢 جارٍ الإذاعة...")
+        ok, fail = do_broadcast(text)
+        edit_message(chat_id, status.get("result",{}).get("message_id"),
+            f" ✅ *تمت الإذاعة!*\n\nوصلت: `{ok}`\nفشلت: `{fail}`")
         return
+
+    if not text: return
 
     if text.startswith("/"):
         cmd = text.split()[0].split("@")[0].lower()
-        handle_command(chat_id, cmd, user_id, username)
+        if cmd == "/start":
+            send_message(chat_id, WELCOME)
+        elif cmd == "/help":
+            send_message(chat_id, HELP)
+        elif cmd == "/id":
+            send_message(chat_id, f" 🆔 `{user_id}`\n👤 @{username}")
+        elif cmd in ("/admin", "/panel") and is_admin(user_id):
+            admin_panel(chat_id)
+        elif cmd == "/broadcast" and is_admin(user_id):
+            parts = text.partition(" ")
+            if parts[2].strip():
+                ok, fail = do_broadcast(parts[2].strip())
+                send_message(chat_id, f" ✅ وصلت: `{ok}` | فشلت: `{fail}`")
+            else:
+                admin_state[user_id] = "await_broadcast"
+                send_message(chat_id, " 📢 أرسل الآن رسالة الإذاعة:")
         return
 
-    url = extract_url(text)
+    url = re.search(r"https?://[^\s<>\"']+", text)
     if url:
-        threading.Thread(
-            target=process_link,
-            args=(chat_id, url, user_id),
-            daemon=True,
-        ).start()
+        threading.Thread(target=process_link,
+            args=(chat_id, user_id, url.group(0)), daemon=True).start()
     else:
-        send_message(chat_id, "❓ أرسل رابط فيديو، أو اكتب /help")
-
+        send_message(chat_id, " ❓ أرسل *رابط فيديو* صالح، أو اكتب /help")
 
 def handle_callback(cb):
     user_id = cb["from"]["id"]
     chat_id = cb["message"]["chat"]["id"]
+    mid     = cb["message"]["message_id"]
     data    = cb.get("data", "")
-    cb_id   = cb["id"]
+    answer_callback(cb["id"])
 
-    answer_callback(cb_id)
+    with session_lock:
+        sess = sessions.get(user_id)
 
-    if data.startswith("fmt:"):
-        try:
-            idx = int(data.split(":", 1)[1])
-        except ValueError:
-            return
-        threading.Thread(
-            target=download_and_send,
-            args=(chat_id, user_id, idx),
-            daemon=True,
-        ).start()
-
-    elif data == "both":
-        threading.Thread(
-            target=download_both,
-            args=(chat_id, user_id),
-            daemon=True,
-        ).start()
-
+    if data == "dl:video":
+        threading.Thread(target=do_download, args=(chat_id, user_id, "video"), daemon=True).start()
+    elif data == "dl:audio":
+        threading.Thread(target=do_download, args=(chat_id, user_id, "audio"), daemon=True).start()
+    elif data == "dl:formats":
+        if not sess: return
+        q = sess.get("qualities", [])
+        if q:
+            edit_message(chat_id, mid, " 🎞 *اختر الجودة:*", kb_formats(q))
+        else:
+            answer_callback(cb["id"], "لا توجد صيغ إضافية")
+    elif data == "dl:back":
+        if sess:
+            edit_message(chat_id, mid, " ❓ *كيف تريد التحميل؟*", kb_main())
+    elif data.startswith("fmt:"):
+        idx = int(data.split(":")[1])
+        if sess and idx < len(sess["qualities"]):
+            fid = sess["qualities"][idx]["format_id"]
+            threading.Thread(target=do_download,
+                args=(chat_id, user_id, "video", fid), daemon=True).start()
+    elif data.startswith("adm:"):
+        if not is_admin(user_id): return
+        if data == "adm:stats":
+            admin_stats(chat_id)
+        elif data == "adm:users":
+            send_message(chat_id,
+                f" 👥 عدد المستخدمين: `{get_users_count()}`",
+                kb_admin())
+        elif data == "adm:broadcast":
+            admin_state[user_id] = "await_broadcast"
+            send_message(chat_id, " 📢 أرسل الآن رسالة الإذاعة:\n(أو /broadcast نص مباشرة)")
+        elif data == "adm:ping":
+            send_message(chat_id, " 🟢 *البوت يعمل بشكل ممتاز!*", kb_admin())
 
 def get_updates(offset):
     try:
-        r = requests.get(
-            f"{TG_BASE}/getUpdates",
-            params={
-                "offset": offset,
-                "timeout": 30,
-                "allowed_updates": json.dumps(
-                    ["message", "callback_query", "edited_message"]
-                ),
-            },
-            timeout=40,
-        )
+        r = requests.get(f"{TG_BASE}/getUpdates",
+            params={"offset": offset, "timeout": 30,
+                    "allowed_updates": json.dumps(["message","callback_query"])},
+            timeout=40)
         return r.json()
     except Exception as e:
         log.warning(f"getUpdates: {e}")
         return {"ok": False, "result": []}
 
-
 def main():
     global OFFSET
-
     me = requests.get(f"{TG_BASE}/getMe", timeout=15).json()
     if not me.get("ok"):
-        log.error("  توكن البوت غير صالح")
-        return
-    log.info(f" البوت: @{me['result']['username']}")
-
-    log.info(" فحص yt-dlp ...")
-    if api_health():
-        log.info(" yt-dlp يعمل")
-    else:
-        log.warning(" yt-dlp غير مثبت")
-
-    log.info(" البوت يعمل الآن. اضغط Ctrl+C للإيقاف.")
-    print()
-
+        log.error("توكن غير صالح"); return
+    log.info(f"البوت: @{me['result']['username']} | المستخدمون: {get_users_count()}")
+    log.info("👑 البوت الفخم يعمل الآن!")
     while True:
         try:
-            updates = get_updates(OFFSET)
-            if not updates.get("ok"):
-                time.sleep(2)
-                continue
-
-            for up in updates.get("result", []):
+            ups = get_updates(OFFSET)
+            if not ups.get("ok"): time.sleep(2); continue
+            for up in ups.get("result", []):
                 OFFSET = up["update_id"] + 1
-
-                if "message" in up:
-                    handle_message(up["message"])
-                elif "edited_message" in up:
-                    handle_message(up["edited_message"])
-                elif "callback_query" in up:
-                    handle_callback(up["callback_query"])
-
-        except KeyboardInterrupt:
-            log.info(" تم الإيقاف")
-            break
+                if "message" in up: handle_message(up["message"])
+                elif "callback_query" in up: handle_callback(up["callback_query"])
+        except KeyboardInterrupt: break
         except Exception as e:
-            log.exception(f"loop error: {e}")
-            time.sleep(3)
-
+            log.exception(f"loop: {e}"); time.sleep(3)
 
 if __name__ == "__main__":
     main()
