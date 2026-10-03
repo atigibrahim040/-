@@ -1,25 +1,28 @@
-name: Telegram Video Bot
-
+name: Telegram Bot
 on:
   schedule:
-    - cron: '0 */5 * * *'  # كل 5 ساعات
+    - cron: '0 */5 * * *'
   workflow_dispatch:
+    inputs:
+      message:
+        description: 'ملاحظة'
+        required: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 290
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -28,5 +31,13 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
+        run: python bot.py
+
+      - name: حفظ قاعدة البيانات
+        if: always()
         run: |
-          python bot.py
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add bot.db
+          git commit -m "update db" || exit 0
+          git push || exit 0
