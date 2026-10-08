@@ -29,14 +29,15 @@ jobs:
 
       - name: Extract session
         run: |
+          echo "=== files in root ==="
+          ls -la
+          echo "=== check session ==="
           if [ -f "session.tar.gz" ]; then
             tar -xzf session.tar.gz
-            echo "=== files count ==="
+            echo "OK: files count"
             ls auth_info_baileys/ | wc -l
-            echo "=== first files ==="
-            ls auth_info_baileys/ | head -5
           else
-            echo "no session file"
+            echo "FAIL: session.tar.gz not found"
             exit 1
           fi
 
