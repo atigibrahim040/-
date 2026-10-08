@@ -1,43 +1,69 @@
-name: Telegram Bot
+name: bot
+
 on:
   schedule:
     - cron: '0 */5 * * *'
   workflow_dispatch:
-    inputs:
-      message:
-        description: 'ملاحظة'
-        required: false
+
+concurrency:
+  group: wa-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 290
+    timeout-minutes: 295
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - uses: actions/setup-python@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          python-version: '3.10'
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
 
-      - name: Install deps
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Extract session
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f "session.tar.gz" ]; then
+            tar -xzf session.tar.gz
+            echo "=== files count ==="
+            ls auth_info_baileys/ | wc -l
+            echo "=== first files ==="
+            ls auth_info_baileys/ | head -5
+          else
+            echo "no session file"
+            exit 1
+          fi
 
-      - name: Run Bot
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Run
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          ADMIN_ID: ${{ secrets.ADMIN_ID }}
-        run: python bot.py
+          ADMIN_NUMBER: ${{ secrets.ADMIN_NUMBER }}
+          API_EXTRACT: ${{ secrets.API_EXTRACT }}
+          API_HEALTH: ${{ secrets.API_HEALTH }}
+          PREFIX: ${{ secrets.PREFIX }}
+          BOT_NAME: ${{ secrets.BOT_NAME }}
+        run: timeout 16500 node bot.js || true
 
-      - name: حفظ قاعدة البيانات
+      - name: Persist session
         if: always()
         run: |
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add bot.db
-          git commit -m "update db" || exit 0
-          git push || exit 0
+          if [ -d "auth_info_baileys" ]; then
+            tar -czf session.tar.gz auth_info_baileys
+            git config user.name "wa-bot"
+            git config user.email "wa-bot@users.noreply.github.com"
+            git add -f session.tar.gz
+            if ! git diff --cached --quiet; then
+              git commit -m "session $(date +%s)"
+              git pull --rebase origin "${GITHUB_REF_NAME}" || true
+              git push origin "HEAD:${GITHUB_REF_NAME}" || true
+            fi
+          fi
